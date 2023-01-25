@@ -46,11 +46,13 @@ pub async fn recreate_client_loop() -> std::io::Result<()> {
         }
 
         let (reader, writer) = tokio::io::split(client);
-        let (send, recv) = mpsc::channel(1);
+        let (bridge_s, bridge_r) = mpsc::channel(1);
+        let (osc_send, osc_recv) = mpsc::channel(1);
 
         let mut task_set = tokio::task::JoinSet::new();
-        task_set.spawn(bridge_recv(reader, recv));
-        task_set.spawn(bridge_send(writer, send));
+        task_set.spawn(bridge_recv(reader, bridge_r));
+        task_set.spawn(bridge_send(writer, bridge_s, osc_send));
+        task_set.spawn(crate::osc::recv_osc(osc_recv));
         // when a task exits, that means an IO error has occurred.
         println!("task died with error: {}", task_set.join_next().await.unwrap().unwrap().unwrap_err());
         // so we immediately abort and create a new connection
@@ -94,7 +96,7 @@ async fn bridge_recv(
                         pending_test = None;
                         let duration = timestamp.duration_since(sent);
                         println!(
-                            "Position test: {}ms ({}μs) since sent {} as x pos",
+                            "driver -> server -> driver: {}ms ({}μs) since sent {} as x pos",
                             duration.as_millis(),
                             duration.as_micros(),
                             pos_x
@@ -107,7 +109,7 @@ async fn bridge_recv(
     }
 }
 
-async fn bridge_send(mut writer: impl AsyncWrite + Unpin, send: mpsc::Sender<(Instant, f32)>) -> std::io::Result<()> {
+async fn bridge_send(mut writer: impl AsyncWrite + Unpin, bridge_send: mpsc::Sender<(Instant, f32)>, osc_send: mpsc::Sender<(Instant, f32)>) -> std::io::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -140,7 +142,9 @@ async fn bridge_send(mut writer: impl AsyncWrite + Unpin, send: mpsc::Sender<(In
         // let timestamp = Instant::now();
         writer.write_all(&buf).await?;
         let timestamp = Instant::now();
-        if let Err(_) = send.send((timestamp, msg.position().x.unwrap())).await {
+        let test = (timestamp, msg.position().x.unwrap());
+
+        if let Err(_) = tokio::try_join!(bridge_send.send(test), osc_send.send(test)) {
             return Err(ErrorKind::NotConnected.into());
         }
     }
